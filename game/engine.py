@@ -36,13 +36,14 @@ class GameEngine:
         enable_log=True,
         rating_store=None,
         first_turn="A",
+        player=None,
     ):
         self.board = BOARD
         self.opts = options or RuleOptions()
         self.names = names or {"A": "pemain-A", "B": "pemain-B"}
         self.rating_store = rating_store
         self.game_id = str(uuid.uuid4())
-
+        self.player=player
         self.state = GameState.initial(self.board, first_turn=first_turn)
         self.logger = Logger(self.game_id, log_dir=log_dir, enabled=enable_log)
         self._callbacks = []

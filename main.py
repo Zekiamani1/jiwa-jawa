@@ -6,7 +6,9 @@ from game.engine import GameEngine
 from game.logger import format_event
 from game.rating import RatingStore
 from game.rules import RuleOptions
-
+import threading
+from game.network import Network
+from game.gui import GameGUI 
 
 class ConsoleUI:
     """Antarmuka teks sederhana."""
@@ -71,12 +73,28 @@ def build_parser():
     p.add_argument("--no-log", action="store_true", help="matikan penulisan log")
     p.add_argument("--ratings", default="ratings.json", help="berkas rating persisten")
     p.add_argument("--no-rating", action="store_true", help="matikan sistem rating")
+    p.add_argument("--host", action="store_true")
+    p.add_argument("--hostip", type=str)
+    p.add_argument("--hostport", type=int)
+    p.add_argument("--port", type=int)
+
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-
+    port = args.port
+    network=Network("0.0.0.0", port)
+    if args.host:
+        network.recvStart()
+        network.sendStart()
+        player="A"
+    else:
+        ip2 = args.hostip
+        port2 = args.hostport
+        network.sendStart(ip2,port2)
+        network.recvStart()
+        player="B"
     engine = GameEngine(
         options=RuleOptions(
             allow_backward=not args.no_backward,
@@ -87,30 +105,23 @@ def main(argv=None):
         log_dir=args.log_dir,
         enable_log=not args.no_log,
         rating_store=None if args.no_rating else RatingStore(args.ratings),
+        player=player
+    )
+    engine.start()
+    gui = GameGUI(engine,network)
+    def receive_loop():
+        while True:
+            packet = network.recvmove()
+            move = packet
+            engine.apply_move(move)
+            gui._redraw()
+    receiver = threading.Thread(
+        target=receive_loop,
+        daemon=True
     )
 
-    if args.gui:
-        from game.gui import launch
-
-        engine.start()
-        launch(engine)
-        return 0
-
-    ui = ConsoleUI(engine)
-    engine.start()
-    while not engine.state.is_over():
-        ui.render()
-        moves = engine.legal_moves()
-        if not moves:
-            break
-        move = ui.choose(moves)
-        if move is None:
-            print("keluar.")
-            return 0
-        result = engine.apply_move(move)
-        if result.game_over:
-            ui.render()
-            print(f"\n== SELESAI: pemenang {result.winner} ({result.reason}) ==")
+    receiver.start()
+    gui.run()
     if not args.no_log:
         print(f"\nlog: {engine.logger.path}")
     return 0

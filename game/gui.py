@@ -40,9 +40,9 @@ COLORS = {
 class GameGUI:
     """Jendela permainan (dua pemain bergantian di satu layar)."""
 
-    def __init__(self, engine, title="Catur Jawa — Dam-daman"):
+    def __init__(self, engine, network,title="Catur Jawa — Dam-daman"):
         import tkinter as tk  # diimpor lokal agar modul lain tetap headless
-
+        self.network=network
         self.tk = tk
         self.engine = engine
         self.board = engine.board
@@ -188,6 +188,7 @@ class GameGUI:
         counts = e.state.counts()
         lines = [
             f"A : {e.names['A']}    B : {e.names['B']}",
+            f"You: {e.player}",
             f"giliran : {e.state.turn}" if not e.state.is_over() else f"HASIL   : {e.state.status}",
             f"bidak   : A={counts['A']['pieces']} (raja {counts['A']['kings']})   "
             f"B={counts['B']['pieces']} (raja {counts['B']['kings']})",
@@ -233,7 +234,10 @@ class GameGUI:
 
         side = self.engine.state.turn
         piece = self.engine.state.piece_at(node)
-
+        if side!=self.engine.player:
+            self._set_status(f"sekarang giliran {side}")
+            self._redraw()
+            return
         if self.selected is None:
             if piece is None or piece.owner != side:
                 self._set_status(f"sekarang giliran {side}")
@@ -279,6 +283,7 @@ class GameGUI:
             self._set_status(f"ditolak: {exc}")
             self._clear_selection()
             return
+        self.network.sendmove(move)
         self.selected, self.partial = None, []
         self.status_text = (
             f"SELESAI — pemenang {result.winner} ({result.reason})" if result.game_over else ""
@@ -308,8 +313,3 @@ class GameGUI:
 
     def run(self):
         self.root.mainloop()
-
-
-def launch(engine):
-    """Buka jendela GUI dan jalankan sampai ditutup."""
-    GameGUI(engine).run()
