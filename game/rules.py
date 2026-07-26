@@ -1,20 +1,34 @@
-"""Aturan permainan: move generation, validasi, promosi, dan DAM.
+"""Aturan permainan Dam-daman (Jawa).
 
-Ini inti gamenya. Semua aturan bekerja di atas graf papan (`board.Board`),
-jadi mengganti papan tidak mengubah file ini.
+Mengikuti aturan Wikibooks "Permainan Tradisional Catur di Indonesia /
+Dam-daman (Jawa)":
+
+  1. Tiap giliran pemain memilih SALAH SATU: jalan satu langkah, atau
+     memakan satu pion lawan di sebelahnya.
+  2. Pion jalan satu langkah ke depan, samping, atau diagonal (tidak
+     mundur). Yang boleh maju-mundur hanya raja.
+  3. Makan = melangkahi SATU pion lawan. Tidak ada rantai lompatan.
+  4. Pion yang sampai garis terakhir daerah lawan menjadi raja; raja
+     bebas maju-mundur sepanjang satu garis yang sama.
+  5. Makan tidak wajib. Tapi kalau ada kesempatan makan dan diabaikan,
+     lawan berhak mengambil 3 pion pihak yang abai secara bebas (DAM).
+  6. Menang bila seluruh pion lawan habis.
+
+Tidak ada opsi/varian — aturannya cuma satu, yang di atas.
 
 Konvensi `Move`:
   - `frm`      : node asal.
-  - `path`     : urutan **titik henti** setelah meninggalkan `frm`
-                 (langkah biasa = 1 elemen; rantai lompatan = tiap
-                 pendaratan; luncuran raja = node tujuan saja).
-  - `captures` : korban sesuai urutan dimakan.
-  - `promote`  : True bila langkah ini mempromosikan bidak.
+  - `to`       : node tujuan.
+  - `captured` : node korban, atau None bila langkah biasa.
+  - `promote`  : True bila langkah ini mempromosikan bidak jadi raja.
 """
 from dataclasses import dataclass
 
 from .board import BOARD, other_side
 from .state import status_for_winner
+DAM_REMOVAL = 3
+
+DRAW_NO_PROGRESS = 50
 
 
 class IllegalMove(Exception):
@@ -28,56 +42,31 @@ class Reason:
     NO_MOVES = "no_moves"
     RESIGN = "resign"
     NO_PROGRESS = "no_progress"
-    REPETITION = "repetition"
-
-
-@dataclass(frozen=True)
-class RuleOptions:
-    """Varian aturan yang bisa dinyalakan/dimatikan."""
-
-    # Bidak biasa boleh mundur (default: bebas segala arah).
-    allow_backward: bool = True
-    # Mode DAM sosial: langkah non-makan diizinkan meski ada lompatan.
-    dam_penalty: bool = False
-    # Jumlah bidak yang dihapus saat DAM dijatuhkan.
-    dam_removal: int = 3
-    # Seri bila sekian langkah tanpa makan & tanpa promosi (0 = mati).
-    draw_no_progress: int = 40
-    # Seri bila posisi identik berulang sekian kali (0 = mati).
-    repetition_limit: int = 3
-    # Raja bergerak & menangkap jarak jauh (flying king).
-    flying_king: bool = True
-
-
-DEFAULT_OPTIONS = RuleOptions()
 
 
 @dataclass(frozen=True)
 class Move:
-    """Satu aksi lengkap dalam satu giliran."""
+    """Satu aksi dalam satu giliran: jalan, atau makan satu pion."""
 
     frm: str
-    path: tuple
-    captures: tuple = ()
+    to: str
+    captured: str = None
     promote: bool = False
 
     def to_dict(self):
         return {
             "from": self.frm,
-            "path": list(self.path),
-            "captures": list(self.captures),
+            "to": self.to,
+            "captured": self.captured,
             "promote": self.promote,
         }
 
     def describe(self):
         """Deskripsi terbaca manusia (untuk log & GUI)."""
-        if self.captures:
-            arrow = " x ".join((self.frm,) + self.path)
+        if self.captured:
+            bits = [f"{self.frm} x {self.to}", f"makan {self.captured}"]
         else:
-            arrow = f"{self.frm} -> {self.path[-1]}"
-        bits = [arrow]
-        if self.captures:
-            bits.append(f"makan {len(self.captures)}: {', '.join(self.captures)}")
+            bits = [f"{self.frm} -> {self.to}"]
         if self.promote:
             bits.append("PROMOSI")
         return " | ".join(bits)
@@ -89,167 +78,124 @@ class MoveEffect:
 
     actor: str
     move: Move
-    captured: list  # [{node, owner, king}, ...]
+    captured: list  # [{node, owner, king}] — kosong atau satu elemen
     promoted: bool
-    dest: str
     ignored_capture: bool = False
 
 
-def _man_capture_chains(board, occ, owner, start):
-    """Semua rantai lompatan **maksimal** untuk bidak biasa.
+def _slide(board, state, node, direction):
+    """Node-node kosong berturut dari `node` ke arah `direction`."""
+    cur = board.step(node, direction)
+    while cur is not None and state.board.get(cur) is None:
+        yield cur
+        cur = board.step(cur, direction)
 
-    Korban tetap di papan selama rantai berlangsung (jadi menghalangi
-    pendaratan) dan tidak boleh dimakan dua kali.
+
+def capture_moves(state, board=BOARD):
+    """Semua langkah makan untuk pemain yang sedang giliran.
+
+    Satu langkah = satu korban. Tidak ada rantai.
     """
-    results = []
-    captured = []
-    path = []
-
-    def dfs(cur):
-        extended = False
-        for nb, direction in board.neighbors[cur]:
-            if nb in captured:
-                continue
-            victim = occ.get(nb)
-            if victim is None or victim.owner == owner:
-                continue
-            landing = board.step(nb, direction)
-            if landing is None or occ.get(landing) is not None:
-                continue
-            extended = True
-            captured.append(nb)
-            path.append(landing)
-            dfs(landing)
-            path.pop()
-            captured.pop()
-        if not extended and path:
-            results.append((tuple(path), tuple(captured)))
-
-    dfs(start)
-    return results
-
-
-def _king_capture_chains(board, occ, owner, start):
-    """Rantai lompatan raja terbang."""
-    results = []
-    captured = []
-    path = []
-
-    def dfs(cur):
-        extended = False
-        for direction in board.by_dir[cur]:
-            # Meluncur melewati node kosong sampai bertemu bidak pertama.
-            node = board.step(cur, direction)
-            while node is not None and occ.get(node) is None:
-                node = board.step(node, direction)
-            if node is None:
-                continue
-            victim = occ.get(node)
-            # Korban yang sudah dimakan menghalangi: tak bisa dimakan/dilewati lagi.
-            if victim is None or victim.owner == owner or node in captured:
-                continue
-            landing = board.step(node, direction)
-            while landing is not None and occ.get(landing) is None:
-                extended = True
-                captured.append(node)
-                path.append(landing)
-                dfs(landing)
-                path.pop()
-                captured.pop()
-                landing = board.step(landing, direction)
-        if not extended and path:
-            results.append((tuple(path), tuple(captured)))
-
-    dfs(start)
-    return results
-
-
-def capture_moves(state, board=BOARD, opts=DEFAULT_OPTIONS):
-    """Semua rantai lompatan maksimal untuk pemain yang sedang giliran."""
     owner = state.turn
     moves = []
     for start in state.nodes_of(owner):
         piece = state.board[start]
-        assert piece is not None
-        occ = dict(state.board)
-        occ[start] = None  # bidak diangkat dari asalnya
-        if piece.king and opts.flying_king:
-            chains = _king_capture_chains(board, occ, owner, start)
+        if piece.king:
+            # Raja meluncur sepanjang garis sampai bertemu bidak pertama.
+            for direction in board.by_dir[start]:
+                node = board.step(start, direction)
+                while node is not None and state.board.get(node) is None:
+                    node = board.step(node, direction)
+                victim = state.board.get(node) if node is not None else None
+                if victim is None or victim.owner == owner:
+                    continue
+                # Mendarat di petak kosong mana pun sesudah korban.
+                landing = board.step(node, direction)
+                while landing is not None and state.board.get(landing) is None:
+                    moves.append(Move(frm=start, to=landing, captured=node))
+                    landing = board.step(landing, direction)
         else:
-            chains = _man_capture_chains(board, occ, owner, start)
-        for path, caps in chains:
-            promote = not piece.king and board.is_promotion(owner, path[-1])
-            moves.append(Move(frm=start, path=path, captures=caps, promote=promote))
+            # Pion melangkahi tetangga langsung, mendarat tepat di baliknya.
+            for nb, direction in board.neighbors[start]:
+                victim = state.board.get(nb)
+                if victim is None or victim.owner == owner:
+                    continue
+                landing = board.step(nb, direction)
+                if landing is None or state.board.get(landing) is not None:
+                    continue
+                moves.append(
+                    Move(
+                        frm=start,
+                        to=landing,
+                        captured=nb,
+                        promote=board.is_promotion(owner, landing),
+                    )
+                )
     return moves
 
 
-def quiet_moves(state, board=BOARD, opts=DEFAULT_OPTIONS):
+def quiet_moves(state, board=BOARD):
     """Semua langkah biasa (tanpa makan) untuk pemain yang sedang giliran."""
     owner = state.turn
     moves = []
     for start in state.nodes_of(owner):
         piece = state.board[start]
-        assert piece is not None
-        if piece.king and opts.flying_king:
+        if piece.king:
             for direction in board.by_dir[start]:
-                node = board.step(start, direction)
-                while node is not None and state.board.get(node) is None:
-                    moves.append(Move(frm=start, path=(node,)))
-                    node = board.step(node, direction)
+                for node in _slide(board, state, start, direction):
+                    moves.append(Move(frm=start, to=node))
         else:
             for nb, direction in board.neighbors[start]:
                 if state.board.get(nb) is not None:
                     continue
-                if not opts.allow_backward and not board.is_forward(owner, direction):
+                # Pion biasa tidak boleh mundur; samping & diagonal maju boleh.
+                if not board.is_forward(owner, direction):
                     continue
-                promote = not piece.king and board.is_promotion(owner, nb)
-                moves.append(Move(frm=start, path=(nb,), promote=promote))
+                moves.append(
+                    Move(frm=start, to=nb, promote=board.is_promotion(owner, nb))
+                )
     return moves
 
 
 def _sorted(moves):
     """Urutan deterministik supaya daftar langkah selalu sama."""
-    return sorted(moves, key=lambda m: (m.frm, m.path, m.captures, m.promote))
+    return sorted(moves, key=lambda m: (m.frm, m.to, m.captured or "", m.promote))
 
 
-def legal_moves(state, board=BOARD, opts=DEFAULT_OPTIONS):
+def legal_moves(state, board=BOARD):
     """Langkah legal untuk pemain yang sedang giliran.
 
-    Bila ada lompatan tersedia, HANYA lompatan yang dikembalikan (wajib
-    makan) — kecuali mode DAM sosial aktif.
+    Makan TIDAK wajib: langkah biasa tetap ada di daftar meski ada
+    kesempatan makan. Konsekuensinya diurus lewat hukuman DAM.
     """
     if state.is_over():
         return []
-    caps = capture_moves(state, board, opts)
-    if caps and not opts.dam_penalty:
-        return _sorted(caps)
-    return _sorted(caps + quiet_moves(state, board, opts))
+    return _sorted(capture_moves(state, board) + quiet_moves(state, board))
 
 
-def moves_from(state, node, board=BOARD, opts=DEFAULT_OPTIONS):
+def moves_from(state, node, board=BOARD):
     """Langkah legal yang berawal dari `node` (dipakai GUI untuk sorotan)."""
-    return [m for m in legal_moves(state, board, opts) if m.frm == node]
+    return [m for m in legal_moves(state, board) if m.frm == node]
 
 
-def has_capture(state, board=BOARD, opts=DEFAULT_OPTIONS):
-    """True bila pemain yang sedang giliran punya minimal satu lompatan."""
-    return bool(capture_moves(state, board, opts))
+def has_capture(state, board=BOARD):
+    """True bila pemain yang sedang giliran punya kesempatan makan."""
+    return bool(capture_moves(state, board))
 
 
-def find_legal(state, move, board=BOARD, opts=DEFAULT_OPTIONS):
+def find_legal(state, move, board=BOARD):
     """Cari padanan kanonik `move` di daftar legal; None bila tidak ada.
 
     Flag `promote` yang dikirim pemanggil diabaikan — promosi dihitung
     sendiri oleh engine supaya tidak bisa dipalsukan.
     """
-    for cand in legal_moves(state, board, opts):
-        if cand.frm == move.frm and cand.path == move.path and cand.captures == move.captures:
+    for cand in legal_moves(state, board):
+        if cand.frm == move.frm and cand.to == move.to and cand.captured == move.captured:
             return cand
     return None
 
 
-
-def apply_move(state, move, board=BOARD, opts=DEFAULT_OPTIONS):
+def apply_move(state, move, board=BOARD):
     """Terapkan `move` ke `state` (memutasi state). Validasi penuh.
 
     Raise `IllegalMove` bila langkah tidak ada di `legal_moves()`.
@@ -257,42 +203,40 @@ def apply_move(state, move, board=BOARD, opts=DEFAULT_OPTIONS):
     if state.is_over():
         raise IllegalMove(f"permainan sudah selesai (status={state.status})")
 
-    canonical = find_legal(state, move, board, opts)
+    canonical = find_legal(state, move, board)
     if canonical is None:
         raise IllegalMove(
             f"langkah tidak legal untuk {state.turn}: "
-            f"{move.frm} -> {list(move.path)} makan {list(move.captures)}"
+            f"{move.frm} -> {move.to} makan {move.captured}"
         )
 
     actor = state.turn
     piece = state.board[canonical.frm]
-    assert piece is not None
 
-    ignored_capture = not canonical.captures and has_capture(state, board, opts)
+    # Dicatat sebelum papan berubah: apakah pemain ini mengabaikan makan?
+    ignored_capture = canonical.captured is None and has_capture(state, board)
 
     captured_info = []
-    for node in canonical.captures:
-        victim = state.board[node]
-        assert victim is not None
-        captured_info.append({"node": node, "owner": victim.owner, "king": victim.king})
-        state.board[node] = None
+    if canonical.captured is not None:
+        victim = state.board[canonical.captured]
+        captured_info.append(
+            {"node": canonical.captured, "owner": victim.owner, "king": victim.king}
+        )
+        state.board[canonical.captured] = None
 
     state.board[canonical.frm] = None
-    dest = canonical.path[-1]
-    state.board[dest] = piece
+    state.board[canonical.to] = piece
     if canonical.promote:
         piece.king = True
 
     # Makan atau promosi dihitung sebagai kemajuan.
-    if canonical.captures or canonical.promote:
+    if canonical.captured is not None or canonical.promote:
         state.since_progress = 0
     else:
         state.since_progress += 1
 
     state.move_no += 1
     state.turn = other_side(actor)
-    key = state.position_key()
-    state.position_counts[key] = state.position_counts.get(key, 0) + 1
     state.history.append({"move_no": state.move_no, "actor": actor, **canonical.to_dict()})
 
     return MoveEffect(
@@ -300,24 +244,21 @@ def apply_move(state, move, board=BOARD, opts=DEFAULT_OPTIONS):
         move=canonical,
         captured=captured_info,
         promoted=canonical.promote,
-        dest=dest,
         ignored_capture=ignored_capture,
     )
 
 
-def apply_dam(state, offender, removed, opts=DEFAULT_OPTIONS):
-    """Hukuman DAM: hapus bidak milik `offender` yang mengabaikan lompatan.
+def apply_dam(state, offender, removed):
+    """Hukuman DAM: ambil pion milik `offender` yang mengabaikan kesempatan makan.
 
-    Giliran tidak berpindah — pihak yang menjatuhkan DAM tetap melangkah,
-    jadi pihak yang abai kehilangan tempo.
+    Maksimal 3 pion, bebas dipilih. Giliran tidak berpindah — pihak yang
+    menjatuhkan DAM tetap melangkah sesudahnya.
     """
-    if not opts.dam_penalty:
-        raise IllegalMove("mode DAM sosial tidak aktif")
     if not removed:
-        raise IllegalMove("DAM harus menghapus minimal 1 bidak")
-    if len(removed) > opts.dam_removal:
+        raise IllegalMove("DAM harus mengambil minimal 1 pion")
+    if len(removed) > DAM_REMOVAL:
         raise IllegalMove(
-            f"DAM maksimal menghapus {opts.dam_removal} bidak, diminta {len(removed)}"
+            f"DAM maksimal mengambil {DAM_REMOVAL} pion, diminta {len(removed)}"
         )
     if len(set(removed)) != len(removed):
         raise IllegalMove("DAM memuat node duplikat")
@@ -326,7 +267,7 @@ def apply_dam(state, offender, removed, opts=DEFAULT_OPTIONS):
     for node in removed:
         piece = state.board.get(node)
         if piece is None or piece.owner != offender:
-            raise IllegalMove(f"node {node!r} bukan bidak milik {offender}")
+            raise IllegalMove(f"node {node!r} bukan pion milik {offender}")
         info.append({"node": node, "owner": piece.owner, "king": piece.king})
     for node in removed:
         state.board[node] = None
@@ -336,12 +277,12 @@ def apply_dam(state, offender, removed, opts=DEFAULT_OPTIONS):
     return info
 
 
-def detect_outcome(state, board=BOARD, opts=DEFAULT_OPTIONS):
+def detect_outcome(state, board=BOARD):
     """Periksa kondisi akhir setelah sebuah langkah.
 
     Kembalikan `(pemenang, alasan)` dengan pemenang "A"/"B"/"draw", atau
-    None bila permainan berlanjut. Diperiksa dari sudut pandang pemain yang
-    giliran berikutnya.
+    None bila permainan berlanjut. Diperiksa dari sudut pandang pemain
+    yang giliran berikutnya.
     """
     if state.is_over():
         return None
@@ -349,14 +290,15 @@ def detect_outcome(state, board=BOARD, opts=DEFAULT_OPTIONS):
     to_move = state.turn
     waiting = other_side(to_move)
 
+    # Aturan Wikibooks: menang bila seluruh pion lawan habis.
     if state.count(to_move) == 0:
         return waiting, Reason.NO_PIECES
-    if not legal_moves(state, board, opts):
+    # Buntu total dihitung kalah — tidak di Wikibooks, tapi permainan
+    # harus punya jalan keluar.
+    if not legal_moves(state, board):
         return waiting, Reason.NO_MOVES
-    if opts.draw_no_progress and state.since_progress >= opts.draw_no_progress:
+    if state.since_progress >= DRAW_NO_PROGRESS:
         return "draw", Reason.NO_PROGRESS
-    if opts.repetition_limit and max(state.position_counts.values(), default=0) >= opts.repetition_limit:
-        return "draw", Reason.REPETITION
     return None
 
 

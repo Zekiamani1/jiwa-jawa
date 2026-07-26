@@ -58,9 +58,6 @@ class Logger:
                 fh.write(json.dumps(ev, ensure_ascii=False, sort_keys=True) + "\n")
         return ev
 
-    def tail(self, n=12):
-        return self.events[-n:]
-
 
 # ---------------------------------------------------------------------------
 # Pembacaan & replay
@@ -99,8 +96,8 @@ def format_event(ev):
     if name == Event.GAME_START:
         return f"{head} MULAI   giliran pertama={detail.get('first_turn')} {detail.get('names', {})}"
     if name == Event.MOVE:
-        arrow = " -> ".join([detail.get("from", "?")] + list(detail.get("path", [])))
-        extra = f" (makan {len(detail.get('captures', []))})" if detail.get("captures") else ""
+        arrow = f"{detail.get('from', '?')} -> {detail.get('to', '?')}"
+        extra = f" (makan {detail['captured']})" if detail.get("captured") else ""
         return f"{head} LANGKAH #{detail.get('move_no', '?')} {arrow}{extra}"
     if name == Event.CAPTURE:
         victims = ", ".join(
@@ -110,7 +107,7 @@ def format_event(ev):
     if name == Event.PROMOTION:
         return f"{head} PROMOSI bidak di {detail.get('node')} menjadi raja"
     if name == Event.DAM:
-        return f"{head} DAM     menghapus {detail.get('removed')} milik {detail.get('offender')}"
+        return f"{head} DAM     mengambil {detail.get('removed')} milik {detail.get('offender')}"
     if name == Event.GAME_OVER:
         return f"{head} SELESAI pemenang={detail.get('winner')} alasan={detail.get('reason')}"
     if name == Event.RATING_UPDATE:

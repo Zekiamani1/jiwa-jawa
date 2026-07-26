@@ -1,9 +1,8 @@
-"""GameEngine — satu pintu masuk untuk GUI / CLI.
+"""GameEngine — satu pintu masuk untuk GUI / jaringan.
 
 Engine menyimpan state, memvalidasi langkah, mencatat log, dan mendeteksi
-akhir permainan. Engine tidak tahu-menahu soal jaringan: kalau nanti ada
-lapisan transport, dia cukup memanggil `legal_moves()` / `apply_move()`
-yang sama seperti GUI.
+akhir permainan. Engine tidak tahu-menahu soal jaringan: lapisan transport
+memanggil `legal_moves()` / `apply_move()` yang sama seperti GUI.
 """
 import uuid
 from dataclasses import dataclass, field
@@ -11,7 +10,7 @@ from dataclasses import dataclass, field
 from . import rules
 from .board import BOARD, other_side
 from .logger import Event, Logger
-from .rules import IllegalMove, Reason, RuleOptions
+from .rules import IllegalMove, Reason
 from .state import GameState
 
 
@@ -26,11 +25,10 @@ class MoveResult:
 
 
 class GameEngine:
-    """Mesin permainan Catur Jawa."""
+    """Mesin permainan Dam-daman."""
 
     def __init__(
         self,
-        options=None,
         names=None,
         log_dir="logs",
         enable_log=True,
@@ -39,16 +37,15 @@ class GameEngine:
         player=None,
     ):
         self.board = BOARD
-        self.opts = options or RuleOptions()
         self.names = names or {"A": "pemain-A", "B": "pemain-B"}
         self.rating_store = rating_store
         self.game_id = str(uuid.uuid4())
-        self.player=player
+        self.player = player
         self.state = GameState.initial(self.board, first_turn=first_turn)
         self.logger = Logger(self.game_id, log_dir=log_dir, enabled=enable_log)
         self._callbacks = []
         self._started = False
-        # diisi bila ada langkah non-makan padahal lompatan tersedia (mode DAM)
+        # diisi bila ada langkah non-makan padahal kesempatan makan tersedia
         self.pending_dam_offender = None
 
     # -- event --------------------------------------------------------------
@@ -76,37 +73,26 @@ class GameEngine:
             self._emit(
                 self.state.turn,
                 Event.GAME_START,
-                {
-                    "first_turn": self.state.turn,
-                    "names": self.names,
-                    "options": {
-                        "allow_backward": self.opts.allow_backward,
-                        "dam_penalty": self.opts.dam_penalty,
-                        "draw_no_progress": self.opts.draw_no_progress,
-                    },
-                },
+                {"first_turn": self.state.turn, "names": self.names},
             )
         )
         return res
 
     # -- aturan -------------------------------------------------------------
     def legal_moves(self):
-        """Langkah legal untuk pemain yang sedang giliran.
-
-        Bila ada lompatan, HANYA lompatan yang dikembalikan (wajib makan).
-        """
-        return rules.legal_moves(self.state, self.board, self.opts)
+        """Langkah legal untuk pemain yang sedang giliran."""
+        return rules.legal_moves(self.state, self.board)
 
     def legal_moves_from(self, node):
         """Langkah legal yang berawal dari `node` (dipakai GUI)."""
-        return rules.moves_from(self.state, node, self.board, self.opts)
+        return rules.moves_from(self.state, node, self.board)
 
     def has_capture(self):
-        return rules.has_capture(self.state, self.board, self.opts)
+        return rules.has_capture(self.state, self.board)
 
     def apply_move(self, move):
         """Terapkan langkah pemain yang sedang giliran. Validasi penuh."""
-        effect = rules.apply_move(self.state, move, self.board, self.opts)
+        effect = rules.apply_move(self.state, move, self.board)
         res = MoveResult()
 
         res.events.append(
@@ -133,11 +119,11 @@ class GameEngine:
                 self._emit(
                     effect.actor,
                     Event.PROMOTION,
-                    {"move_no": self.state.move_no, "node": effect.dest},
+                    {"move_no": self.state.move_no, "node": effect.move.to},
                 )
             )
 
-        # Mode DAM sosial: catat siapa yang mengabaikan lompatan.
+        # Catat siapa yang mengabaikan kesempatan makan; lawan boleh DAM.
         self.pending_dam_offender = effect.actor if effect.ignored_capture else None
 
         self._finish_if_over(res)
@@ -153,12 +139,12 @@ class GameEngine:
         return res
 
     def call_dam(self, removed):
-        """Jatuhkan hukuman DAM kepada pihak yang mengabaikan lompatan."""
+        """Ambil pion pihak yang mengabaikan kesempatan makan (maks 3)."""
         res = MoveResult()
         offender = self.pending_dam_offender
         if offender is None:
-            raise IllegalMove("tidak ada lompatan yang diabaikan")
-        info = rules.apply_dam(self.state, offender, removed, self.opts)
+            raise IllegalMove("tidak ada kesempatan makan yang diabaikan")
+        info = rules.apply_dam(self.state, offender, removed)
         self.pending_dam_offender = None
         res.events.append(
             self._emit(
@@ -170,9 +156,13 @@ class GameEngine:
         self._finish_if_over(res)
         return res
 
+    def skip_dam(self):
+        """Lepaskan hak DAM tanpa mengambil pion."""
+        self.pending_dam_offender = None
+
     # -- akhir permainan ----------------------------------------------------
     def _finish_if_over(self, res):
-        outcome = rules.detect_outcome(self.state, self.board, self.opts)
+        outcome = rules.detect_outcome(self.state, self.board)
         if outcome is not None:
             self._declare_over(res, *outcome)
 

@@ -1,14 +1,13 @@
 
 import argparse
 import sys
+import uuid
 
 from game.engine import GameEngine
 from game.logger import format_event
 from game.rating import RatingStore
-from game.rules import RuleOptions
-import threading
 from game.network import Network
-from game.gui import GameGUI 
+from game.gui import GameGUI
 
 class ConsoleUI:
     """Antarmuka teks sederhana."""
@@ -66,62 +65,53 @@ def build_parser():
     )
     p.add_argument("--gui", action="store_true", help="pakai GUI Tkinter")
     p.add_argument("--names", nargs=2, metavar=("A", "B"), default=["pemain-A", "pemain-B"])
-    p.add_argument("--no-backward", action="store_true", help="bidak biasa tidak boleh mundur")
-    p.add_argument("--dam-penalty", action="store_true", help="aktifkan mode DAM sosial")
-    p.add_argument("--draw-after", type=int, default=40, help="seri setelah N langkah tanpa kemajuan")
     p.add_argument("--log-dir", default="logs", help="direktori log JSONL")
     p.add_argument("--no-log", action="store_true", help="matikan penulisan log")
     p.add_argument("--ratings", default="ratings.json", help="berkas rating persisten")
     p.add_argument("--no-rating", action="store_true", help="matikan sistem rating")
-    p.add_argument("--host", action="store_true")
-    p.add_argument("--hostip", type=str)
-    p.add_argument("--hostport", type=int)
-    p.add_argument("--port", type=int)
+    p.add_argument("--host", action="store_true", help="jadi host (dapat sisi A, jalan duluan)")
+    p.add_argument("--hostip", type=str, help="IP host (untuk penantang)")
+    p.add_argument("--hostport", type=int, help="port host (untuk penantang)")
+    p.add_argument("--port", type=int, required=True, help="port lokal untuk mendengar")
 
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    port = args.port
-    network=Network("0.0.0.0", port)
+    network = Network(args.port)
     if args.host:
-        network.recvStart()
-        network.sendStart()
-        player="A"
+        def buat_config(hello):
+            return {
+                "game_id": str(uuid.uuid4()),
+                "first_turn": "A",
+                "names": {"A": args.names[0], "B": hello.get("name", args.names[1])},
+            }
+        print(f"menunggu penantang di port {args.port} ...")
+        hello = network.accept(buat_config)
+        player = "A"
+        print(f"terhubung dengan {hello.get('name')} dari {network.peer[0]}")
     else:
-        ip2 = args.hostip
-        port2 = args.hostport
-        network.sendStart(ip2,port2)
-        network.recvStart()
-        player="B"
+        if not args.hostip or not args.hostport:
+            raise SystemExit("penantang butuh --hostip dan --hostport")
+        print(f"menghubungi {args.hostip}:{args.hostport} ...")
+        network.connect(args.hostip, args.hostport, {"name": args.names[1]})
+        player = "B"
+        print("terhubung")
+    config = network.config
     engine = GameEngine(
-        options=RuleOptions(
-            allow_backward=not args.no_backward,
-            dam_penalty=args.dam_penalty,
-            draw_no_progress=args.draw_after,
-        ),
-        names={"A": args.names[0], "B": args.names[1]},
+        names=config["names"],
         log_dir=args.log_dir,
         enable_log=not args.no_log,
         rating_store=None if args.no_rating else RatingStore(args.ratings),
-        player=player
+        first_turn=config["first_turn"],
+        player=player,
     )
+    engine.game_id = config["game_id"]      
     engine.start()
-    gui = GameGUI(engine,network)
-    def receive_loop():
-        while True:
-            packet = network.recvmove()
-            move = packet
-            engine.apply_move(move)
-            gui._redraw()
-    receiver = threading.Thread(
-        target=receive_loop,
-        daemon=True
-    )
-
-    receiver.start()
+    gui = GameGUI(engine, network)
     gui.run()
+    network.close()
     if not args.no_log:
         print(f"\nlog: {engine.logger.path}")
     return 0

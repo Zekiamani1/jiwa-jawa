@@ -41,19 +41,15 @@ class GameState:
     status: str = Status.PLAYING
     # riwayat langkah, untuk ditampilkan / ditelusuri
     history: list = field(default_factory=list)
-    # langkah berturut tanpa makan & tanpa promosi (untuk deteksi seri)
+    # langkah berturut tanpa makan & tanpa promosi (jaring pengaman seri)
     since_progress: int = 0
-    # berapa kali tiap posisi muncul (untuk deteksi seri karena repetisi)
-    position_counts: dict = field(default_factory=dict)
 
     @classmethod
     def initial(cls, board=BOARD, first_turn="A"):
         cells = {n: None for n in board.nodes}
         for node, owner in board.start_pieces.items():
             cells[node] = Piece(owner=owner)
-        state = cls(board=cells, turn=first_turn)
-        state.position_counts[state.position_key()] = 1
-        return state
+        return cls(board=cells, turn=first_turn)
 
     # -- pembacaan ----------------------------------------------------------
     def piece_at(self, node):
@@ -85,7 +81,10 @@ class GameState:
         return self.status != Status.PLAYING
 
     def position_key(self):
-        """Kunci posisi untuk deteksi repetisi: susunan bidak + giliran."""
+        """Ringkasan posisi: susunan bidak + giliran.
+
+        Dipakai untuk membandingkan papan dua sisi lewat jaringan.
+        """
         parts = [
             f"{n}:{p.owner}{'K' if p.king else ''}"
             for n, p in sorted(self.board.items())

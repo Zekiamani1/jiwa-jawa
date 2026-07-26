@@ -5,15 +5,17 @@ tidak ada aturan permainan di sini. Papan digambar dari `board.py`
 (node + edge), jadi mengganti papan otomatis mengganti tampilan.
 
 Interaksi:
-  - Klik-1 pada bidak yang sedang giliran -> tujuan legal disorot.
-  - Klik-2 pada tujuan -> langkah diterapkan.
-  - Untuk rantai lompatan, klik pendaratan berikutnya satu per satu sampai
-    rantai lengkap (rantai wajib diselesaikan).
+  - Klik-1 pada bidak yang sedang giliran -> tujuan legal disorot
+    (hijau = jalan biasa, merah = makan).
+  - Klik-2 pada tujuan -> langkah diterapkan. Selalu satu langkah;
+    tidak ada rantai lompatan.
+  - Bila lawan mengabaikan kesempatan makan, GUI masuk mode DAM: klik
+    sampai 3 pion lawan untuk diambil, atau tekan "Lewati DAM".
 """
 
 
 from .logger import format_event
-from .rules import IllegalMove
+from .rules import DAM_REMOVAL, IllegalMove
 
 CELL = 58
 MARGIN = 42
@@ -31,6 +33,7 @@ COLORS = {
     "sel": "#1f8fff",
     "target": "#2fbf5f",
     "capture": "#e0483c",
+    "dam": "#d38bff",
     "king": "#e8b32a",
     "text": "#f0e6d2",
     "muted": "#a89880",
@@ -38,17 +41,17 @@ COLORS = {
 
 
 class GameGUI:
-    """Jendela permainan (dua pemain bergantian di satu layar)."""
+    """Jendela permainan."""
 
-    def __init__(self, engine, network,title="Catur Jawa — Dam-daman"):
+    def __init__(self, engine, network=None, title="Catur Jawa — Dam-daman"):
         import tkinter as tk  # diimpor lokal agar modul lain tetap headless
-        self.network=network
+        self.network = network
         self.tk = tk
         self.engine = engine
         self.board = engine.board
 
         self.selected = None
-        self.partial = []
+        self.dam_picked = []
         self.status_text = "siap"
 
         self._layout(title)
@@ -102,6 +105,9 @@ class GameGUI:
         buttons = tk.Frame(right, bg=COLORS["bg"])
         buttons.pack(fill="x", pady=(8, 0))
         tk.Button(buttons, text="Batal pilih", command=self._clear_selection).pack(side="left", padx=2)
+        self.dam_button = tk.Button(buttons, text="Ambil DAM", command=self._take_dam)
+        self.dam_button.pack(side="left", padx=2)
+        tk.Button(buttons, text="Lewati DAM", command=self._skip_dam).pack(side="left", padx=2)
         tk.Button(buttons, text="Menyerah", command=self._resign).pack(side="left", padx=2)
 
     # -- koordinat ----------------------------------------------------------
@@ -118,6 +124,19 @@ class GameGUI:
             if d < best_d:
                 best, best_d = node, d
         return best
+
+    # -- mode DAM -----------------------------------------------------------
+    def _dam_korban(self):
+        """Pion pihak yang abai — yang boleh diambil sebagai DAM."""
+        return self.engine.state.nodes_of(self.engine.pending_dam_offender)
+
+    def _dam_mode(self):
+        """True bila pemain lokal sedang berhak mengambil DAM."""
+        e = self.engine
+        if e.pending_dam_offender is None or e.state.is_over():
+            return False
+        # Yang berhak mengambil adalah pihak yang sekarang giliran.
+        return e.player is None or e.state.turn == e.player
 
     # -- penggambaran -------------------------------------------------------
     def _redraw(self):
@@ -139,24 +158,16 @@ class GameGUI:
             x, y = self._xy(node)
             c.create_oval(x - 5, y - 5, x + 5, y + 5, fill=COLORS["node"], outline=COLORS["line"])
 
-        # Sorotan tujuan legal berikutnya.
-        candidates = self._candidates()
-        depth = len(self.partial)
-        for node in self._next_targets(candidates):
-            x, y = self._xy(node)
-            is_capture = any(
-                m.captures and len(m.path) > depth and m.path[depth] == node for m in candidates
-            )
-            color = COLORS["capture"] if is_capture else COLORS["target"]
-            c.create_oval(x - 14, y - 14, x + 14, y + 14, outline=color, width=3)
-
-        # Jejak rantai lompatan yang sudah dipilih.
-        if self.selected:
-            trail = [self.selected] + self.partial
-            for a, b in zip(trail, trail[1:]):
-                x1, y1 = self._xy(a)
-                x2, y2 = self._xy(b)
-                c.create_line(x1, y1, x2, y2, fill=COLORS["sel"], width=3, dash=(6, 3))
+        # Sorotan: target DAM, atau tujuan legal bidak terpilih.
+        if self._dam_mode():
+            for node in self._dam_korban():
+                x, y = self._xy(node)
+                c.create_oval(x - 14, y - 14, x + 14, y + 14, outline=COLORS["dam"], width=3)
+        elif self.selected is not None:
+            for m in self.engine.legal_moves_from(self.selected):
+                x, y = self._xy(m.to)
+                color = COLORS["capture"] if m.captured else COLORS["target"]
+                c.create_oval(x - 14, y - 14, x + 14, y + 14, outline=color, width=3)
 
         for node, piece in self.engine.state.board.items():
             if piece is None:
@@ -168,10 +179,11 @@ class GameGUI:
             )
             if piece.king:
                 c.create_text(x, y, text="★", fill=COLORS["king"], font=("TkDefaultFont", 15, "bold"))
-            if node == self.selected:
+            if node == self.selected or node in self.dam_picked:
+                ring = COLORS["dam"] if node in self.dam_picked else COLORS["sel"]
                 c.create_oval(
                     x - PIECE_R - 4, y - PIECE_R - 4, x + PIECE_R + 4, y + PIECE_R + 4,
-                    outline=COLORS["sel"], width=3,
+                    outline=ring, width=3,
                 )
 
         for node in ("apex_A", "apex_B"):
@@ -198,83 +210,107 @@ class GameGUI:
 
         if e.state.is_over():
             hint = f"Permainan selesai: {e.state.status}."
+        elif self._dam_mode():
+            hint = (
+                f"DAM! {e.pending_dam_offender} mengabaikan kesempatan makan. "
+                f"Klik sampai {DAM_REMOVAL} pion lawan lalu tekan 'Ambil DAM', "
+                f"atau 'Lewati DAM'. Terpilih: {len(self.dam_picked)}."
+            )
         elif self.selected is None:
-            hint = "Pilih bidak. " + (
-                "WAJIB MAKAN: hanya bidak yang bisa melompat yang bisa dipilih."
-                if e.has_capture() and not e.opts.dam_penalty
-                else "Klik bidak untuk melihat tujuan legal."
+            hint = "Klik bidak untuk melihat tujuan legal. Makan tidak wajib — "
+            hint += (
+                "TAPI kamu punya kesempatan makan; kalau diabaikan lawan boleh ambil 3 pionmu."
+                if e.has_capture()
+                else "tidak ada kesempatan makan sekarang."
             )
         else:
             hint = f"Terpilih {self.selected}. Klik lingkaran tujuan."
-            if self.partial:
-                hint += f" Rantai: {' -> '.join(self.partial)} (wajib dilanjutkan)."
         self.hint.config(text=f"{hint}\n{self.status_text}")
 
     # -- interaksi ----------------------------------------------------------
-    def _candidates(self):
-        """Langkah yang masih cocok dengan rantai yang sudah diklik."""
-        if self.selected is None:
-            return []
-        depth = len(self.partial)
-        return [
-            m
-            for m in self.engine.legal_moves_from(self.selected)
-            if tuple(m.path[:depth]) == tuple(self.partial)
-        ]
-
-    def _next_targets(self, candidates):
-        """Node yang boleh diklik berikutnya pada kedalaman rantai saat ini."""
-        depth = len(self.partial)
-        return {m.path[depth] for m in candidates if len(m.path) > depth}
-
     def _on_click(self, event):
         node = self._node_at(event.x, event.y)
         if node is None or self.engine.state.is_over():
             return
 
+        if self._dam_mode():
+            self._click_dam(node)
+            return
+
         side = self.engine.state.turn
         piece = self.engine.state.piece_at(node)
-        if side!=self.engine.player:
-            self._set_status(f"sekarang giliran {side}")
-            self._redraw()
-            return
-        if self.selected is None:
-            if piece is None or piece.owner != side:
-                self._set_status(f"sekarang giliran {side}")
-                self._redraw()
-                return
-            if not self.engine.legal_moves_from(node):
-                self._set_status(f"{node} tidak punya langkah legal")
-                self._redraw()
-                return
-            self.selected, self.partial = node, []
-            self._set_status("")
+        if self.engine.player is not None and side != self.engine.player:
+            self._set_status(f"menunggu lawan ({side})")
             self._redraw()
             return
 
-        # Klik bidak sendiri lagi = ganti pilihan (selama rantai belum dimulai).
-        if not self.partial and piece is not None and piece.owner == side:
+        # Klik bidak sendiri = pilih / ganti pilihan.
+        if piece is not None and piece.owner == side:
             if node == self.selected:
                 self._clear_selection()
-            elif self.engine.legal_moves_from(node):
+            elif not self.engine.legal_moves_from(node):
+                self._set_status(f"{node} tidak punya langkah legal")
+                self._redraw()
+            else:
                 self.selected = node
                 self._set_status("")
                 self._redraw()
             return
 
-        candidates = self._candidates()
-        if node not in self._next_targets(candidates):
-            self._set_status("tujuan tidak legal")
+        if self.selected is None:
+            self._set_status(f"sekarang giliran {side}")
             self._redraw()
             return
 
-        self.partial.append(node)
-        exact = [m for m in candidates if tuple(m.path) == tuple(self.partial)]
-        if exact:
-            self._play(exact[0])
-        else:
-            self._set_status("rantai lompatan wajib dilanjutkan")
+        cocok = [m for m in self.engine.legal_moves_from(self.selected) if m.to == node]
+        if not cocok:
+            self._set_status("tujuan tidak legal")
             self._redraw()
+            return
+        self._play(cocok[0])
+
+    def _click_dam(self, node):
+        if node in self.dam_picked:
+            self.dam_picked.remove(node)
+        elif node not in self._dam_korban():
+            self._set_status("itu bukan pion pihak yang abai")
+        elif len(self.dam_picked) >= DAM_REMOVAL:
+            self._set_status(f"maksimal {DAM_REMOVAL} pion")
+        else:
+            self.dam_picked.append(node)
+            self._set_status("")
+        self._redraw()
+
+    def _take_dam(self):
+        if not self._dam_mode() or not self.dam_picked:
+            self._set_status("belum ada pion DAM yang dipilih")
+            self._redraw()
+            return
+        diambil = list(self.dam_picked)
+        try:
+            result = self.engine.call_dam(diambil)
+        except IllegalMove as exc:
+            self._set_status(f"DAM ditolak: {exc}")
+            self.dam_picked = []
+            self._redraw()
+            return
+        self.dam_picked = []
+        if self.network is not None:
+            self.network.send_dam(diambil)
+        self.status_text = f"DAM: mengambil {len(diambil)} pion"
+        if result.game_over:
+            self.status_text = f"SELESAI — pemenang {result.winner} ({result.reason})"
+            if self.network is not None:
+                self.network.send_end(result.winner, result.reason)
+        self._redraw()
+
+    def _skip_dam(self):
+        if not self._dam_mode():
+            return
+        self.engine.skip_dam()
+        self.dam_picked = []
+        self._set_status("hak DAM dilewati")
+        self._redraw()
 
     def _play(self, move):
         try:
@@ -283,33 +319,77 @@ class GameGUI:
             self._set_status(f"ditolak: {exc}")
             self._clear_selection()
             return
-        self.network.sendmove(move)
-        self.selected, self.partial = None, []
+
+        if self.network is not None:
+            if result.game_over:
+                self.network.send_end(result.winner, result.reason, move)
+            else:
+                self.network.send_move(move)
+
+        self.selected = None
         self.status_text = (
             f"SELESAI — pemenang {result.winner} ({result.reason})" if result.game_over else ""
         )
         self._redraw()
 
     def _clear_selection(self):
-        self.selected, self.partial = None, []
+        self.selected = None
         self._redraw()
 
     def _resign(self):
-        loser = self.engine.state.turn
-        result = self.engine.resign()
+        loser = self.engine.player or self.engine.state.turn
+        result = self.engine.resign(side=loser)
         if result.game_over:
             self.status_text = f"{loser} menyerah — pemenang {result.winner}"
+            if self.network is not None:
+                self.network.send_end(result.winner, result.reason)
         self._clear_selection()
 
     def _set_status(self, text):
         self.status_text = text
 
-    # -- callback engine ----------------------------------------------------
     def on_event(self, event):
         self.log.config(state="normal")
         self.log.insert("end", format_event(event) + "\n")
         self.log.see("end")
         self.log.config(state="disabled")
 
+    def read_from_network(self):
+        if self.network is not None:
+            while True:
+                data = self.network.read()
+                if data is None:
+                    break
+                self.handle_remote(data)
+        self.root.after(60, self.read_from_network)
+
+    def handle_remote(self, data):
+        if data["lost"]:
+            self._set_status("koneksi terputus — lawan tidak merespons")
+            self._redraw()
+            return
+        if data.get("dam"):
+            try:
+                self.engine.call_dam(data["dam"])
+            except IllegalMove as exc:
+                self._set_status(f"DAM lawan ditolak: {exc}")
+        if data["move"] is not None:
+            # Lawan sudah melangkah, jadi haknya atas DAM dilepas.
+            if self.engine.pending_dam_offender == self.engine.state.turn:
+                self.engine.skip_dam()
+            try:
+                self.engine.apply_move(data["move"])
+            except IllegalMove as exc:
+                self._set_status(f"langkah lawan ditolak: {exc}")
+        if data["end"] is not None:
+            end = data["end"]
+            if not self.engine.state.is_over() and end["winner"] in ("A", "B"):
+                kalah = "B" if end["winner"] == "A" else "A"
+                self.engine.resign(side=kalah)
+            self.status_text = f"SELESAI — pemenang {end['winner']} ({end['reason']})"
+        self._redraw()
+
     def run(self):
+        if self.network is not None:
+            self.root.after(60, self.read_from_network)
         self.root.mainloop()
