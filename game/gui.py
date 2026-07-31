@@ -189,12 +189,6 @@ class GameGUI:
                     outline=ring, width=3,
                 )
 
-        for node in ("apex_A", "apex_B"):
-            if self.board.has_node(node):
-                x, y = self._xy(node)
-                c.create_text(
-                    x, y - PIECE_R - 12, text=node, fill=COLORS["line"], font=("TkDefaultFont", 7)
-                )
 
         self._update_info()
 

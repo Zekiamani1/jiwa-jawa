@@ -9,7 +9,8 @@ Dam-daman (Jawa)":
      mundur). Yang boleh maju-mundur hanya raja.
   3. Makan = melangkahi SATU pion lawan. Tidak ada rantai lompatan.
   4. Pion yang sampai garis terakhir daerah lawan menjadi raja; raja
-     bebas maju-mundur sepanjang satu garis yang sama.
+     bergerak satu langkah ke tetangga langsung sama seperti pion,
+     hanya saja raja boleh mundur.
   5. Makan tidak wajib. Tapi kalau ada kesempatan makan dan diabaikan,
      lawan berhak mengambil 3 pion pihak yang abai secara bebas (DAM).
   6. Menang bila seluruh pion lawan habis.
@@ -83,14 +84,6 @@ class MoveEffect:
     ignored_capture: bool = False
 
 
-def _slide(board, state, node, direction):
-    """Node-node kosong berturut dari `node` ke arah `direction`."""
-    cur = board.step(node, direction)
-    while cur is not None and state.board.get(cur) is None:
-        yield cur
-        cur = board.step(cur, direction)
-
-
 def capture_moves(state, board=BOARD):
     """Semua langkah makan untuk pemain yang sedang giliran.
 
@@ -100,37 +93,26 @@ def capture_moves(state, board=BOARD):
     moves = []
     for start in state.nodes_of(owner):
         piece = state.board[start]
-        if piece.king:
-            # Raja meluncur sepanjang garis sampai bertemu bidak pertama.
-            for direction in board.by_dir[start]:
-                node = board.step(start, direction)
-                while node is not None and state.board.get(node) is None:
-                    node = board.step(node, direction)
-                victim = state.board.get(node) if node is not None else None
-                if victim is None or victim.owner == owner:
-                    continue
-                # Mendarat di petak kosong mana pun sesudah korban.
-                landing = board.step(node, direction)
-                while landing is not None and state.board.get(landing) is None:
-                    moves.append(Move(frm=start, to=landing, captured=node))
-                    landing = board.step(landing, direction)
-        else:
-            # Pion melangkahi tetangga langsung, mendarat tepat di baliknya.
-            for nb, direction in board.neighbors[start]:
-                victim = state.board.get(nb)
-                if victim is None or victim.owner == owner:
-                    continue
-                landing = board.step(nb, direction)
-                if landing is None or state.board.get(landing) is not None:
-                    continue
-                moves.append(
-                    Move(
-                        frm=start,
-                        to=landing,
-                        captured=nb,
-                        promote=board.is_promotion(owner, landing),
-                    )
+        # Pion dan raja sama-sama melangkahi tetangga langsung, mendarat
+        # tepat di baliknya. Bedanya: raja boleh makan ke segala arah,
+        # pion hanya ke arah maju.
+        for nb, direction in board.neighbors[start]:
+            if not piece.king and not board.is_forward(owner, direction):
+                continue
+            victim = state.board.get(nb)
+            if victim is None or victim.owner == owner:
+                continue
+            landing = board.step(nb, direction)
+            if landing is None or state.board.get(landing) is not None:
+                continue
+            moves.append(
+                Move(
+                    frm=start,
+                    to=landing,
+                    captured=nb,
+                    promote=(not piece.king) and board.is_promotion(owner, landing),
                 )
+            )
     return moves
 
 
@@ -140,20 +122,20 @@ def quiet_moves(state, board=BOARD):
     moves = []
     for start in state.nodes_of(owner):
         piece = state.board[start]
-        if piece.king:
-            for direction in board.by_dir[start]:
-                for node in _slide(board, state, start, direction):
-                    moves.append(Move(frm=start, to=node))
-        else:
-            for nb, direction in board.neighbors[start]:
-                if state.board.get(nb) is not None:
-                    continue
-                # Pion biasa tidak boleh mundur; samping & diagonal maju boleh.
-                if not board.is_forward(owner, direction):
-                    continue
-                moves.append(
-                    Move(frm=start, to=nb, promote=board.is_promotion(owner, nb))
+        for nb, direction in board.neighbors[start]:
+            if state.board.get(nb) is not None:
+                continue
+            # Pion tidak boleh mundur; raja boleh ke segala arah — tapi
+            # tetap satu langkah ke tetangga langsung, sama seperti pion.
+            if not piece.king and not board.is_forward(owner, direction):
+                continue
+            moves.append(
+                Move(
+                    frm=start,
+                    to=nb,
+                    promote=(not piece.king) and board.is_promotion(owner, nb),
                 )
+            )
     return moves
 
 
