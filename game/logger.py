@@ -84,17 +84,24 @@ def _fmt_ts(ts):
         return "--:--:--"
 
 
-def format_event(ev):
-    """Satu baris riwayat yang terbaca manusia."""
+def format_event(ev, names=None):
+    """Satu baris riwayat yang terbaca manusia. `names` opsional untuk
+    substitusi label A/B menjadi nama pemain."""
     if ev.get("_corrupt"):
         return f"[baris {ev['_line']}] <baris rusak>"
 
+    def sub(x):
+        if names and isinstance(x, str) and x in names:
+            return names[x]
+        return x
+
     detail = ev.get("detail", {})
     name = ev.get("event", "?")
-    head = f"[{ev.get('seq', '?'):>4}] {_fmt_ts(ev.get('ts', 0))} {ev.get('actor', '?'):<6}"
+    actor = sub(ev.get("actor", "?"))
+    head = f"[{ev.get('seq', '?'):>4}] {_fmt_ts(ev.get('ts', 0))} {str(actor):<12}"
 
     if name == Event.GAME_START:
-        return f"{head} MULAI   giliran pertama={detail.get('first_turn')} {detail.get('names', {})}"
+        return f"{head} MULAI   giliran pertama={sub(detail.get('first_turn'))}"
     if name == Event.MOVE:
         arrow = f"{detail.get('from', '?')} -> {detail.get('to', '?')}"
         extra = f" (makan {detail['captured']})" if detail.get("captured") else ""
@@ -107,13 +114,13 @@ def format_event(ev):
     if name == Event.PROMOTION:
         return f"{head} PROMOSI bidak di {detail.get('node')} menjadi raja"
     if name == Event.DAM:
-        return f"{head} DAM     mengambil {detail.get('removed')} milik {detail.get('offender')}"
+        return f"{head} DAM     mengambil {detail.get('removed')} milik {sub(detail.get('offender'))}"
     if name == Event.GAME_OVER:
-        return f"{head} SELESAI pemenang={detail.get('winner')} alasan={detail.get('reason')}"
+        return f"{head} SELESAI pemenang={sub(detail.get('winner'))} alasan={detail.get('reason')}"
     if name == Event.RATING_UPDATE:
         ratings, delta = detail.get("ratings", {}), detail.get("delta", {})
         parts = " ".join(
-            f"{s}={ratings.get(s, 0):.1f}({delta.get(s, 0):+.1f})" for s in sorted(ratings)
+            f"{sub(s)}={ratings.get(s, 0):.1f}({delta.get(s, 0):+.1f})" for s in sorted(ratings)
         )
         return f"{head} RATING  {parts}"
     return f"{head} {name.upper():<7} {json.dumps(detail, ensure_ascii=False)}"

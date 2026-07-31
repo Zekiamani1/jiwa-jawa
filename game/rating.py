@@ -14,7 +14,7 @@ import json
 import os
 from dataclasses import dataclass, field
 
-DEFAULT_RATING = 1200.0
+DEFAULT_RATING = 400
 DEFAULT_STORE = "ratings.json"
 
 

@@ -43,16 +43,20 @@ COLORS = {
 class GameGUI:
     """Jendela permainan."""
 
-    def __init__(self, engine, network=None, title="Catur Jawa — Dam-daman"):
+    def __init__(self, engine, network=None, on_end=None, title="JAWA"):
         import tkinter as tk  # diimpor lokal agar modul lain tetap headless
         self.network = network
         self.tk = tk
         self.engine = engine
         self.board = engine.board
+        self.on_end = on_end
 
         self.selected = None
         self.dam_picked = []
         self.status_text = "siap"
+        self.end_info = None       # {"winner": ..., "reason": ...} setelah selesai
+        self._closing = False
+        self._after_id = None
 
         self._layout(title)
         engine.on_event(self.on_event)
@@ -104,7 +108,6 @@ class GameGUI:
 
         buttons = tk.Frame(right, bg=COLORS["bg"])
         buttons.pack(fill="x", pady=(8, 0))
-        tk.Button(buttons, text="Batal pilih", command=self._clear_selection).pack(side="left", padx=2)
         self.dam_button = tk.Button(buttons, text="Ambil DAM", command=self._take_dam)
         self.dam_button.pack(side="left", padx=2)
         tk.Button(buttons, text="Lewati DAM", command=self._skip_dam).pack(side="left", padx=2)
@@ -195,15 +198,20 @@ class GameGUI:
 
         self._update_info()
 
+    def _name(self, side):
+        return self.engine.names.get(side, side) if side in ("A", "B") else side
+
     def _update_info(self):
         e = self.engine
         counts = e.state.counts()
+        your_name = self._name(e.player) if e.player in ("A", "B") else "-"
         lines = [
-            f"A : {e.names['A']}    B : {e.names['B']}",
-            f"You: {e.player}",
-            f"giliran : {e.state.turn}" if not e.state.is_over() else f"HASIL   : {e.state.status}",
-            f"bidak   : A={counts['A']['pieces']} (raja {counts['A']['kings']})   "
-            f"B={counts['B']['pieces']} (raja {counts['B']['kings']})",
+            f"{self._name('A')}   vs   {self._name('B')}",
+            f"Kamu    : {your_name}",
+            (f"Giliran : {self._name(e.state.turn)}"
+             if not e.state.is_over() else f"HASIL   : {e.state.status}"),
+            f"{self._name('A')}: {counts['A']['pieces']} bidak (raja {counts['A']['kings']})",
+            f"{self._name('B')}: {counts['B']['pieces']} bidak (raja {counts['B']['kings']})",
             f"langkah : {e.state.move_no}   tanpa kemajuan: {e.state.since_progress}",
         ]
         self.info.config(text="\n".join(lines))
@@ -212,7 +220,7 @@ class GameGUI:
             hint = f"Permainan selesai: {e.state.status}."
         elif self._dam_mode():
             hint = (
-                f"DAM! {e.pending_dam_offender} mengabaikan kesempatan makan. "
+                f"DAM! {self._name(e.pending_dam_offender)} mengabaikan kesempatan makan. "
                 f"Klik sampai {DAM_REMOVAL} pion lawan lalu tekan 'Ambil DAM', "
                 f"atau 'Lewati DAM'. Terpilih: {len(self.dam_picked)}."
             )
@@ -240,7 +248,7 @@ class GameGUI:
         side = self.engine.state.turn
         piece = self.engine.state.piece_at(node)
         if self.engine.player is not None and side != self.engine.player:
-            self._set_status(f"menunggu lawan ({side})")
+            self._set_status(f"menunggu lawan ({self._name(side)})")
             self._redraw()
             return
 
@@ -258,7 +266,7 @@ class GameGUI:
             return
 
         if self.selected is None:
-            self._set_status(f"sekarang giliran {side}")
+            self._set_status(f"sekarang giliran {self._name(side)}")
             self._redraw()
             return
 
@@ -299,9 +307,10 @@ class GameGUI:
             self.network.send_dam(diambil)
         self.status_text = f"DAM: mengambil {len(diambil)} pion"
         if result.game_over:
-            self.status_text = f"SELESAI — pemenang {result.winner} ({result.reason})"
+            self.status_text = f"SELESAI — pemenang {self._name(result.winner)} ({result.reason})"
             if self.network is not None:
                 self.network.send_end(result.winner, result.reason)
+            self._mark_end(result.winner, result.reason)
         self._redraw()
 
     def _skip_dam(self):
@@ -328,8 +337,10 @@ class GameGUI:
 
         self.selected = None
         self.status_text = (
-            f"SELESAI — pemenang {result.winner} ({result.reason})" if result.game_over else ""
+            f"SELESAI — pemenang {self._name(result.winner)} ({result.reason})" if result.game_over else ""
         )
+        if result.game_over:
+            self._mark_end(result.winner, result.reason)
         self._redraw()
 
     def _clear_selection(self):
@@ -340,28 +351,56 @@ class GameGUI:
         loser = self.engine.player or self.engine.state.turn
         result = self.engine.resign(side=loser)
         if result.game_over:
-            self.status_text = f"{loser} menyerah — pemenang {result.winner}"
+            self.status_text = f"{self._name(loser)} menyerah — pemenang {self._name(result.winner)}"
             if self.network is not None:
                 self.network.send_end(result.winner, result.reason)
+            self._mark_end(result.winner, result.reason)
         self._clear_selection()
 
     def _set_status(self, text):
         self.status_text = text
 
+    def _mark_end(self, winner, reason):
+        """Simpan info akhir permainan dan picu popup (jendela game tetap terbuka)."""
+        if self.end_info is not None:
+            return
+        self.end_info = {"winner": winner, "reason": reason}
+        if self.on_end is not None:
+            self.root.after(50, lambda: self.on_end(winner, reason))
+
     def on_event(self, event):
         self.log.config(state="normal")
-        self.log.insert("end", format_event(event) + "\n")
+        self.log.insert("end", format_event(event, names=self.engine.names) + "\n")
         self.log.see("end")
         self.log.config(state="disabled")
 
     def read_from_network(self):
+        self._after_id = None
+        if self._closing:
+            return
         if self.network is not None:
             while True:
                 data = self.network.read()
                 if data is None:
                     break
                 self.handle_remote(data)
-        self.root.after(60, self.read_from_network)
+        try:
+            self._after_id = self.root.after(60, self.read_from_network)
+        except self.tk.TclError:
+            pass
+
+    def _on_close(self):
+        self._closing = True
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except self.tk.TclError:
+                pass
+            self._after_id = None
+        try:
+            self.root.destroy()
+        except self.tk.TclError:
+            pass
 
     def handle_remote(self, data):
         if data["lost"]:
@@ -386,10 +425,14 @@ class GameGUI:
             if not self.engine.state.is_over() and end["winner"] in ("A", "B"):
                 kalah = "B" if end["winner"] == "A" else "A"
                 self.engine.resign(side=kalah)
-            self.status_text = f"SELESAI — pemenang {end['winner']} ({end['reason']})"
+            self.status_text = f"SELESAI — pemenang {self._name(end['winner'])} ({end['reason']})"
+            self._mark_end(end["winner"], end["reason"])
+        if data["lost"]:
+            self._mark_end(None, "koneksi terputus")
         self._redraw()
 
     def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if self.network is not None:
-            self.root.after(60, self.read_from_network)
+            self._after_id = self.root.after(60, self.read_from_network)
         self.root.mainloop()
