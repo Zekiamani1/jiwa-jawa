@@ -260,23 +260,34 @@ def apply_dam(state, offender, removed):
 
 
 def detect_outcome(state, board=BOARD):
-    """Periksa kondisi akhir setelah sebuah langkah.
+    """Periksa kondisi akhir setelah sebuah langkah atau DAM.
 
     Kembalikan `(pemenang, alasan)` dengan pemenang "A"/"B"/"draw", atau
-    None bila permainan berlanjut. Diperiksa dari sudut pandang pemain
-    yang giliran berikutnya.
+    None bila permainan berlanjut.
+
+    Cek KEDUA pemain — bukan cuma pemain yang giliran — karena DAM bisa
+    menghabiskan bidak pihak yang bukan sedang giliran (offender), dan
+    giliran tidak berpindah sesudah DAM.
     """
     if state.is_over():
         return None
 
+    a_pieces = state.count("A")
+    b_pieces = state.count("B")
+
+    # Aturan Wikibooks: menang bila seluruh pion lawan habis. Cek dari
+    # kedua sisi supaya DAM yang menghabiskan offender juga tertangkap.
+    if a_pieces == 0 and b_pieces == 0:
+        return "draw", Reason.NO_PIECES
+    if a_pieces == 0:
+        return "B", Reason.NO_PIECES
+    if b_pieces == 0:
+        return "A", Reason.NO_PIECES
+
+    # Buntu total: pemain yang sedang giliran tidak punya langkah legal.
+    # Tidak di Wikibooks, tapi permainan harus punya jalan keluar.
     to_move = state.turn
     waiting = other_side(to_move)
-
-    # Aturan Wikibooks: menang bila seluruh pion lawan habis.
-    if state.count(to_move) == 0:
-        return waiting, Reason.NO_PIECES
-    # Buntu total dihitung kalah — tidak di Wikibooks, tapi permainan
-    # harus punya jalan keluar.
     if not legal_moves(state, board):
         return waiting, Reason.NO_MOVES
     if state.since_progress >= DRAW_NO_PROGRESS:
